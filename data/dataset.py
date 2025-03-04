@@ -13,13 +13,12 @@ class SinogramDataset(Dataset):
     Args:
         sinogram_path (str): Path to the complete sinogram data
         mask_angles (tuple): Range of angles to mask (e.g., (30, 60) for 30-60 degrees)
-        transform (callable, optional): Optional transform to be applied to the data
-        mask_paths (list, optional): List of paths to predefined masks
-        use_predefined_masks (bool): Whether to use predefined masks or create on-the-fly
         block_size (int): Size of each block along the ring difference dimension
     """
     def __init__(self, sinogram_path, mask_angles=None, transform=None, 
                  mask_paths=None, use_predefined_masks=False, block_size=64):
+        # Note: transform, mask_paths, and use_predefined_masks parameters are kept
+        # for backward compatibility but are not used since augmentation is disabled
         self.sinogram_data = torch.load(sinogram_path)
         self.transform = transform
         self.mask_angles = mask_angles

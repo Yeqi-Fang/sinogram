@@ -188,18 +188,9 @@ def main():
     logger = setup_logging(log_dir)
     logger.info(f"Starting training with arguments: {args}")
     
-    # Create augmentation if enabled
-    if not args.no_augmentation and Config.USE_AUGMENTATION:
-        augmentation = SinogramAugmentation(
-            rotate_prob=Config.ROTATE_PROB,
-            noise_prob=Config.NOISE_PROB,
-            mask_prob=Config.MASK_PROB,
-            noise_level=Config.NOISE_LEVEL
-        )
-        logger.info("Using data augmentation")
-    else:
-        augmentation = None
-        logger.info("No data augmentation")
+    # Data augmentation is disabled
+    augmentation = None
+    logger.info("Data augmentation is disabled")
     
     # Create datasets
     if args.use_patches:

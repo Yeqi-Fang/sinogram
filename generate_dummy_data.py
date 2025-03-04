@@ -426,13 +426,11 @@ def main():
                        help="Number of planes")
     parser.add_argument("--block_size", type=int, default=32,
                        help="Block size for data division")
-    parser.add_argument("--num_variants", type=int, default=4,
-                       help="Number of incomplete sinogram variants to generate")
     parser.add_argument("--noise_level", type=float, default=0.02,
                        help="Noise level for synthetic data")
-    parser.add_argument("--pattern", type=str, default="phantom",
+    parser.add_argument("--pattern", type=str, default="brain",
                        choices=["phantom", "rings", "brain"],
-                       help="Pattern to generate (brain is slowest)")
+                       help="Pattern to generate")
     
     args = parser.parse_args()
     
@@ -443,17 +441,14 @@ def main():
     
     # Generate complete sinogram based on selected pattern
     if args.pattern == "phantom":
-        print("Generating phantom sinogram...")
         complete_sinogram = generate_phantom_sinogram(
             args.height, args.width, args.depth, noise_level=args.noise_level
         )
     elif args.pattern == "rings":
-        print("Generating ring sinogram...")
         complete_sinogram = generate_ring_data(
             args.height, args.width, args.depth, noise_level=args.noise_level
         )
     else:  # brain
-        print("Generating brain-like sinogram (this may take a while)...")
         complete_sinogram = generate_brain_like_sinogram(
             args.height, args.width, args.depth, noise_level=args.noise_level
         )
@@ -464,59 +459,47 @@ def main():
     torch.save(complete_sinogram, os.path.join(args.output_dir, "complete_sinogram.pt"))
     print(f"Saved complete sinogram to {os.path.join(args.output_dir, 'complete_sinogram.pt')}")
     
-    # Create incomplete sinograms with different masks
-    print("Creating incomplete sinograms with different masks...")
-    incomplete_sinograms = create_incomplete_sinograms(
-        complete_sinogram, num_variants=args.num_variants
-    )
+    # Create visualization directory
+    vis_dir = os.path.join(args.output_dir, "visualizations")
+    os.makedirs(vis_dir, exist_ok=True)
     
-    # Save incomplete sinograms
-    for i, (masked_sino, mask_angles) in enumerate(incomplete_sinograms):
-        torch.save(masked_sino, os.path.join(args.output_dir, f"incomplete_sinogram_{i+1}.pt"))
-        print(f"Saved incomplete sinogram {i+1} with mask angles {mask_angles} to "
-              f"{os.path.join(args.output_dir, f'incomplete_sinogram_{i+1}.pt')}")
+    # Visualize slices of the complete sinogram
+    depth = complete_sinogram.shape[2]
+    slice_indices = [0, depth//4, depth//2, 3*depth//4, depth-1]
+    slice_indices = [min(i, depth-1) for i in slice_indices]
     
-    # Visualize sinograms
-    print("Generating visualizations...")
-    visualize_sinograms(
-        complete_sinogram, incomplete_sinograms, 
-        os.path.join(args.output_dir, "visualizations")
-    )
-    print(f"Saved visualizations to {os.path.join(args.output_dir, 'visualizations')}")
+    for slice_idx in slice_indices:
+        plt.figure(figsize=(10, 8))
+        plt.imshow(complete_sinogram[:, :, slice_idx].numpy(), cmap='hot', aspect='auto')
+        plt.title(f"Complete Sinogram (Slice {slice_idx})")
+        plt.colorbar()
+        plt.tight_layout()
+        plt.savefig(os.path.join(vis_dir, f"sinogram_slice_{slice_idx}.png"))
+        plt.close()
+    
+    print(f"Saved visualizations to {vis_dir}")
     
     # Create training and testing datasets using block division
-    print("Creating training and testing datasets...")
     train_dir = os.path.join(args.output_dir, "train")
     test_dir = os.path.join(args.output_dir, "test")
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     
     # Randomly split the sinogram for training and testing
-    depth = complete_sinogram.shape[2]
-    indices = torch.randperm(depth)
+    indices = np.random.permutation(depth)
     train_indices = indices[:int(0.8 * depth)]
     test_indices = indices[int(0.8 * depth):]
     
     # Create training dataset
-    train_complete = torch.zeros((complete_sinogram.shape[0], 
-                                  complete_sinogram.shape[1], 
-                                  len(train_indices)))
-    for i, idx in enumerate(train_indices):
-        train_complete[:, :, i] = complete_sinogram[:, :, idx]
-    
+    train_complete = complete_sinogram[:, :, train_indices]
     torch.save(train_complete, os.path.join(train_dir, "complete_sinogram.pt"))
     
     # Create testing dataset
-    test_complete = torch.zeros((complete_sinogram.shape[0], 
-                                 complete_sinogram.shape[1], 
-                                 len(test_indices)))
-    for i, idx in enumerate(test_indices):
-        test_complete[:, :, i] = complete_sinogram[:, :, idx]
-    
+    test_complete = complete_sinogram[:, :, test_indices]
     torch.save(test_complete, os.path.join(test_dir, "complete_sinogram.pt"))
     
     # Create blocks for training and testing
-    block_size = min(args.block_size, train_complete.shape[2])
+    block_size = min(args.block_size, depth)
     
     # Create and save blocks for training
     train_blocks = []

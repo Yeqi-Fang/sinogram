@@ -24,11 +24,11 @@ class Config:
     POOL_SIZE = (4, 4)
     
     # Augmentation parameters
-    USE_AUGMENTATION = True
-    ROTATE_PROB = 0.5
-    NOISE_PROB = 0.3
-    MASK_PROB = 0.7
-    NOISE_LEVEL = 0.02
+    USE_AUGMENTATION = False  # Disabled data augmentation
+    ROTATE_PROB = 0.0
+    NOISE_PROB = 0.0
+    MASK_PROB = 0.0
+    NOISE_LEVEL = 0.0
     
     # Training parameters
     BATCH_SIZE = 4
