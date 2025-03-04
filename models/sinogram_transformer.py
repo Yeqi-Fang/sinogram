@@ -110,7 +110,7 @@ class SinogramTransformer(nn.Module):
         # 编码每个块，得到大小为 [B*num_blocks, embed_dim, pool_size[0]*pool_size[1]]
         encoded = self.block_encoder(blocks)
         # 变回 (B, num_blocks, d_model)
-        encoded = encoded.view(B, self.num_blocks, -1)
+        encoded = encoded.reshape(B, self.num_blocks, -1)
         
         # 添加位置编码（广播到每个batch）
         positions = torch.arange(self.num_blocks, device=x.device).expand(B, self.num_blocks)
@@ -123,7 +123,7 @@ class SinogramTransformer(nn.Module):
         decoded = []
         for i in range(self.num_blocks):
             # 提取第i个块的token并恢复形状 [B, d_model] -> [B, embed_dim, pool_size[0]*pool_size[1]]
-            block_token = transformed[:, i].view(B, -1, self.pool_size[0] * self.pool_size[1])
+            block_token = transformed[:, i].reshape(B, -1, self.pool_size[0] * self.pool_size[1])
             block_decoded = self.block_decoder(block_token, original_shape)  # [B, H, W, block_channels]
             decoded.append(block_decoded)
             
