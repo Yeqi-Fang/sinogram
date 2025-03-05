@@ -3,4 +3,4 @@ __pycache__
 *.pyi
 *.pyc
 data/pet_dataset
-outputs/checkpoints
+outputs/checkpoints/*.pth
