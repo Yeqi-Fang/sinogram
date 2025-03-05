@@ -37,7 +37,7 @@ def calculate_psnr(pred, target):
 
 def calculate_ssim(pred, target):
     """
-    Calculate Structural Similarity Index
+    Calculate Structural Similarity Index for 3D sinogram data
     
     Args:
         pred (torch.Tensor or np.ndarray): Predicted sinogram
@@ -61,17 +61,35 @@ def calculate_ssim(pred, target):
     if target_max > 0:
         target = target / target_max
     
-    # Handle multi-dimensional data
+    # Calculate SSIM for 2D slices and average
+    # For 3D data (height, width, depth), take slices along the first axis
     if pred.ndim == 3:
-        # Calculate SSIM for each slice and average
+        # Calculate SSIM for a sample of slices (to save computation)
+        depth = pred.shape[2]
+        sample_indices = np.linspace(0, depth-1, min(10, depth), dtype=int)
+        
         ssim_values = []
-        for i in range(pred.shape[2]):
-            ssim_val = ssim(target[:, :, i], pred[:, :, i], data_range=1.0)
+        for i in sample_indices:
+            # Use a smaller win_size to avoid issues with small image dimensions
+            ssim_val = ssim(target[:, :, i], pred[:, :, i], 
+                            data_range=1.0, win_size=5)
             ssim_values.append(ssim_val)
         return np.mean(ssim_values)
+    elif pred.ndim == 4:  # For batched data [B, H, W, D]
+        batch_size = pred.shape[0]
+        depth = pred.shape[3]
+        sample_indices = np.linspace(0, depth-1, min(5, depth), dtype=int)
+        
+        ssim_values = []
+        for b in range(batch_size):
+            for i in sample_indices:
+                ssim_val = ssim(target[b, :, :, i], pred[b, :, :, i], 
+                                data_range=1.0, win_size=5)
+                ssim_values.append(ssim_val)
+        return np.mean(ssim_values)
     else:
-        # Calculate SSIM directly
-        return ssim(target, pred, data_range=1.0)
+        # For 2D data, calculate SSIM directly with smaller window
+        return ssim(target, pred, data_range=1.0, win_size=5)
 
 def calculate_rmse(pred, target):
     """

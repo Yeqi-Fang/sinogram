@@ -1,547 +1,422 @@
 """
-Generate synthetic sinogram data for testing PET reconstruction models.
-This script creates realistic-looking sinogram data with configurable dimensions
-and patterns to mimic PET scanner output, using only PyTorch operations to avoid
-NumPy compatibility issues.
+生成特定尺寸的合成正弦图数据，专门用于PET重建模型测试。
+固定高度为112，宽度为225，通道数为1024，块大小为32。
+生成100张训练图像和10张测试图像，每张图像都有一个角度被掩码处理。
+使用多进程加速数据生成，避免GPU加速。
 """
 import os
-import torch
+import numpy as np
 import math
 import argparse
 from tqdm import tqdm
 import matplotlib
-matplotlib.use('Agg')  # Use non-interactive backend
+matplotlib.use('Agg')  # 使用非交互式后端
 import matplotlib.pyplot as plt
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+# 设置全局参数
+HEIGHT = 112
+WIDTH = 225
+DEPTH = 1024
+BLOCK_SIZE = 32
 
 def create_angle_mask(sinogram_shape, start_angle, end_angle):
     """
-    Create a binary mask for the sinogram to simulate missing angular data.
-    
-    Args:
-        sinogram_shape (tuple): Shape of the sinogram (angles, radial, planes)
-        start_angle (float): Starting angle in degrees to mask
-        end_angle (float): Ending angle in degrees to mask
-        
-    Returns:
-        torch.Tensor: Binary mask where 0 indicates masked regions
+    创建角度掩码
     """
     total_angles = sinogram_shape[0]
-    mask = torch.ones(sinogram_shape)
+    mask = np.ones(sinogram_shape)
     
-    # Convert angles to indices
+    # 将角度转换为索引
     start_idx = int(start_angle / 180 * total_angles)
     end_idx = int(end_angle / 180 * total_angles)
     
-    # Set masked region to 0
+    # 将掩码区域设置为0
     mask[start_idx:end_idx, :, :] = 0
     
     return mask
 
 def apply_mask(sinogram, mask):
     """
-    Apply mask to sinogram to simulate incomplete data
-    
-    Args:
-        sinogram (torch.Tensor): Complete sinogram data
-        mask (torch.Tensor): Binary mask where 0 indicates masked regions
-        
-    Returns:
-        torch.Tensor: Masked sinogram
+    应用掩码
     """
     return sinogram * mask
 
 def normalize_sinogram(sinogram):
     """
-    Normalize sinogram data to [0, 1] range
-    
-    Args:
-        sinogram (torch.Tensor): Raw sinogram data
-        
-    Returns:
-        torch.Tensor: Normalized sinogram
+    归一化正弦图数据到[0, 1]范围
     """
-    min_val = sinogram.min()
-    max_val = sinogram.max()
+    min_val = np.min(sinogram)
+    max_val = np.max(sinogram)
     return (sinogram - min_val) / (max_val - min_val + 1e-8)
 
-def generate_phantom_sinogram(height, width, depth, num_sources=5, noise_level=0.02):
+def generate_phantom_sinogram(height, width, depth, seed=None, noise_level=0.02):
     """
-    Generate a synthetic sinogram with point sources.
-    
-    Args:
-        height (int): Number of angular samples (theta)
-        width (int): Number of radial samples (r)
-        depth (int): Number of planes (ring differences)
-        num_sources (int): Number of point sources to simulate
-        noise_level (float): Standard deviation of Gaussian noise
+    生成带有点源的合成正弦图，使用固定种子以便重现
+    """
+    if seed is not None:
+        np.random.seed(seed)
         
-    Returns:
-        torch.Tensor: Synthetic sinogram
-    """
-    # Create empty sinogram
-    sinogram = torch.zeros((height, width, depth))
+    # 创建空的正弦图
+    sinogram = np.zeros((height, width, depth), dtype=np.float32)
     
-    # Generate random point sources using torch's random functions
+    # 生成随机点源
+    num_sources = 5
     sources = []
     for _ in range(num_sources):
-        # Random position in image space
-        x = torch.rand(1).item() * 1.5 - 0.75  # uniform [-0.75, 0.75]
-        y = torch.rand(1).item() * 1.5 - 0.75  # uniform [-0.75, 0.75]
-        # Random intensity (higher near center)
-        intensity = (torch.rand(1).item() * 0.5 + 0.5) * (1.0 - 0.5 * (x**2 + y**2))
-        # Random size
-        size = torch.rand(1).item() * 0.15 + 0.05  # uniform [0.05, 0.2]
+        # 图像空间中的随机位置
+        x = np.random.uniform(-0.75, 0.75)
+        y = np.random.uniform(-0.75, 0.75)
+        # 随机强度（中心位置更高）
+        intensity = np.random.uniform(0.5, 1.0) * (1.0 - 0.5 * (x**2 + y**2))
+        # 随机大小
+        size = np.random.uniform(0.05, 0.2)
         sources.append((x, y, intensity, size))
     
-    # For each angle, calculate projection
-    angle_range = torch.linspace(0, math.pi, height)
+    # 创建角度和径向位置数组
+    angles = np.linspace(0, math.pi, height)
+    r_values = np.linspace(-1, 1, width)
     
-    for angle_idx, angle in enumerate(angle_range):
-        sin_theta = torch.sin(angle).item()
-        cos_theta = torch.cos(angle).item()
+    # 创建深度缩放数组
+    depth_scale = np.linspace(1.0, 0.4, depth)
+    depth_indices = np.arange(depth)
+    ring_diff = np.abs(depth_indices - depth // 2) / (depth // 2)
+    depth_falloff = np.exp(-ring_diff * 2)
+    
+    # 对每个角度
+    for angle_idx, angle in enumerate(angles):
+        sin_theta = np.sin(angle)
+        cos_theta = np.cos(angle)
         
-        # For each radial position
-        r_values = torch.linspace(-1, 1, width)
-        
+        # 对每个径向位置
         for r_idx, r in enumerate(r_values):
-            r = r.item()
             
-            # For each source, calculate contribution
+            # 对每个源，计算贡献
             for x, y, intensity, size in sources:
-                # Project point onto line
+                # 投影点到线上
                 proj_dist = abs(x * cos_theta + y * sin_theta - r)
                 
-                # Calculate contribution (Gaussian profile)
-                contrib = intensity * math.exp(-(proj_dist**2) / (2 * size**2))
+                # 计算贡献（高斯曲线）
+                contrib = intensity * np.exp(-(proj_dist**2) / (2 * size**2))
                 
-                # Add to sinogram (for all depths with scaling)
-                depth_scale = torch.linspace(1.0, 0.4, depth)
-                for d in range(depth):
-                    ring_diff = abs(d - depth // 2) / (depth // 2)  # Normalize ring difference
-                    scale = math.exp(-ring_diff * 2)  # Exponential falloff with ring difference
-                    sinogram[angle_idx, r_idx, d] += contrib * depth_scale[d].item() * scale
+                # 添加到正弦图（使用向量化操作应用到所有深度）
+                sinogram[angle_idx, r_idx, :] += contrib * depth_scale * depth_falloff
     
-    # Add background activity
-    background = torch.ones_like(sinogram) * 0.05
+    # 添加背景活动
+    background = np.ones_like(sinogram) * 0.05
     sinogram = sinogram + background
     
-    # Add noise
-    noise = torch.randn_like(sinogram) * noise_level
+    # 添加噪声
+    noise = np.random.normal(0, noise_level, sinogram.shape)
     sinogram = sinogram + noise
     
-    # Ensure non-negative values
-    sinogram = torch.clamp(sinogram, min=0.0)
+    # 确保非负值
+    sinogram = np.clip(sinogram, 0.0, None)
     
-    # Normalize
+    # 归一化
     sinogram = normalize_sinogram(sinogram)
     
-    return sinogram
+    # 确保float32类型
+    return sinogram.astype(np.float32)
 
-def generate_ring_data(height, width, depth, num_rings=8, noise_level=0.02):
+def generate_brain_like_sinogram(height, width, depth, seed=None, noise_level=0.02):
     """
-    Generate synthetic sinogram with ring patterns.
-    
-    Args:
-        height (int): Number of angular samples (theta)
-        width (int): Number of radial samples (r)
-        depth (int): Number of planes (ring differences)
-        num_rings (int): Number of rings to generate
-        noise_level (float): Standard deviation of Gaussian noise
+    生成类似大脑活动的合成正弦图，使用固定种子以便重现
+    """
+    if seed is not None:
+        np.random.seed(seed)
         
-    Returns:
-        torch.Tensor: Synthetic sinogram
-    """
-    # Create empty sinogram
-    sinogram = torch.zeros((height, width, depth))
+    # 创建空的正弦图
+    sinogram = np.zeros((height, width, depth), dtype=np.float32)
     
-    # Generate rings of different radii
-    centers = []
-    for _ in range(num_rings):
-        # Random center position
-        cx = torch.rand(1).item() - 0.5  # uniform [-0.5, 0.5]
-        cy = torch.rand(1).item() - 0.5  # uniform [-0.5, 0.5]
-        # Random radius
-        radius = torch.rand(1).item() * 0.3 + 0.1  # uniform [0.1, 0.4]
-        # Random intensity
-        intensity = torch.rand(1).item() * 0.6 + 0.4  # uniform [0.4, 1.0]
-        centers.append((cx, cy, radius, intensity))
-    
-    # Precompute angles
-    angle_range = torch.linspace(0, math.pi, height)
-    
-    # For each angle, calculate projection
-    for angle_idx, angle in enumerate(angle_range):
-        sin_theta = torch.sin(angle).item()
-        cos_theta = torch.cos(angle).item()
-        
-        # Create projection for each ring
-        for cx, cy, radius, intensity in centers:
-            # Calculate projected position of center
-            center_proj = cx * cos_theta + cy * sin_theta
-            
-            # Calculate start and end points of ring projection
-            start_proj = center_proj - radius
-            end_proj = center_proj + radius
-            
-            # Convert to pixel indices
-            start_idx = int((start_proj + 1) * (width - 1) / 2)
-            end_idx = int((end_proj + 1) * (width - 1) / 2)
-            
-            # Clamp indices to valid range
-            start_idx = max(0, min(width - 1, start_idx))
-            end_idx = max(0, min(width - 1, end_idx))
-            
-            # Create intensity profile (higher at edges)
-            if start_idx < end_idx:
-                # Rectangular profile
-                for r_idx in range(start_idx, end_idx + 1):
-                    # Normalized position within ring
-                    rel_pos = (r_idx - start_idx) / max(1, end_idx - start_idx)
-                    # Intensity profile (higher at edges)
-                    edge_factor = 4 * (rel_pos - 0.5)**2  # Parabolic profile
-                    profile = intensity * (0.5 + 0.5 * edge_factor)
-                    
-                    # Add to sinogram with depth scaling
-                    for d in range(depth):
-                        ring_diff = abs(d - depth // 2) / (depth // 2)
-                        scale = math.exp(-ring_diff * 2)
-                        sinogram[angle_idx, r_idx, d] += profile * scale
-    
-    # Add background activity
-    background = torch.ones_like(sinogram) * 0.08
-    sinogram = sinogram + background
-    
-    # Add noise
-    noise = torch.randn_like(sinogram) * noise_level
-    sinogram = sinogram + noise
-    
-    # Ensure non-negative values
-    sinogram = torch.clamp(sinogram, min=0.0)
-    
-    # Normalize
-    sinogram = normalize_sinogram(sinogram)
-    
-    return sinogram
-
-def generate_brain_like_sinogram(height, width, depth, noise_level=0.02):
-    """
-    Generate a synthetic sinogram resembling brain activity.
-    
-    Args:
-        height (int): Number of angular samples (theta)
-        width (int): Number of radial samples (r)
-        depth (int): Number of planes (ring differences)
-        noise_level (float): Standard deviation of Gaussian noise
-        
-    Returns:
-        torch.Tensor: Synthetic sinogram
-    """
-    # Create empty sinogram
-    sinogram = torch.zeros((height, width, depth))
-    
-    # Define brain-like structures
+    # 定义类脑结构
     structures = []
     
-    # Outer skull (ring)
-    structures.append(('ring', 0, 0, 0.8, 0.15, 0.4))  # type, cx, cy, radius, thickness, intensity
+    # 外部颅骨（环）
+    structures.append(('ring', 0, 0, 0.8, 0.15, 0.4))  # 类型，cx，cy，半径，厚度，强度
     
-    # Brain tissue (filled circle)
-    structures.append(('disk', 0, 0, 0.65, 0, 0.6))  # type, cx, cy, radius, _, intensity
+    # 脑组织（填充圆）
+    structures.append(('disk', 0, 0, 0.65, 0, 0.6))  # 类型，cx，cy，半径，_，强度
     
-    # Ventricles (darker regions)
-    structures.append(('disk', 0.1, 0, 0.15, 0, -0.3))  # Negative intensity to subtract
+    # 脑室（较暗区域）
+    structures.append(('disk', 0.1, 0, 0.15, 0, -0.3))  # 负强度用于减法
     structures.append(('disk', -0.1, 0, 0.15, 0, -0.3))
     
-    # Hot spots (small bright regions)
+    # 热点（小亮区）
     for _ in range(10):
-        # Random position within brain
-        angle = torch.rand(1).item() * 2 * math.pi
-        dist = torch.rand(1).item() * 0.5
+        # 大脑内的随机位置
+        angle = np.random.uniform(0, 2 * math.pi)
+        dist = np.random.uniform(0, 0.5)
         x = dist * math.cos(angle)
         y = dist * math.sin(angle)
-        # Random size and intensity
-        size = torch.rand(1).item() * 0.07 + 0.05  # uniform [0.05, 0.12]
-        intensity = torch.rand(1).item() * 0.4 + 0.3  # uniform [0.3, 0.7]
+        # 随机大小和强度
+        size = np.random.uniform(0.05, 0.12)
+        intensity = np.random.uniform(0.3, 0.7)
         structures.append(('disk', x, y, size, 0, intensity))
     
-    # Precompute angles
-    angle_range = torch.linspace(0, math.pi, height)
+    # 创建深度缩放数组
+    depth_indices = np.arange(depth)
+    ring_diff = np.abs(depth_indices - depth // 2) / (depth // 2)
+    depth_falloff = np.exp(-ring_diff * 2)
     
-    # For each angle, calculate projection
-    for angle_idx, angle in enumerate(tqdm(angle_range, desc="Generating brain-like sinogram")):
-        sin_theta = torch.sin(angle).item()
-        cos_theta = torch.cos(angle).item()
+    # 创建角度和径向位置数组
+    angles = np.linspace(0, math.pi, height)
+    r_values = np.linspace(-1, 1, width)
+    
+    # 对每个角度
+    for angle_idx, angle in tqdm(enumerate(angles), desc="生成类脑正弦图", total=len(angles)):
+        sin_theta = np.sin(angle)
+        cos_theta = np.cos(angle)
         
-        # For each radial position
-        r_values = torch.linspace(-1, 1, width)
-        
+        # 对每个径向位置
         for r_idx, r in enumerate(r_values):
-            r = r.item()
             
-            # Process each structure
+            # 处理每个结构
             for structure in structures:
                 struct_type, cx, cy, radius, thickness, intensity = structure
                 
-                # Project center onto line
+                # 将中心投影到线上
                 center_proj = cx * cos_theta + cy * sin_theta
                 
                 if struct_type == 'ring':
-                    # Calculate start and end points of ring projection
+                    # 计算环投影的起点和终点
                     inner_radius = radius - thickness/2
                     outer_radius = radius + thickness/2
                     
-                    # Inner and outer edge projections
+                    # 内部和外部边缘投影
                     inner_start = center_proj - inner_radius
                     inner_end = center_proj + inner_radius
                     outer_start = center_proj - outer_radius
                     outer_end = center_proj + outer_radius
                     
-                    # Check if current r is within the projected ring
+                    # 检查当前r是否在投影环内
                     if (outer_start <= r <= inner_start) or (inner_end <= r <= outer_end):
-                        # Distance from r to nearest inner edge
+                        # r到最近内边缘的距离
                         if r <= center_proj:
                             edge_dist = min(abs(r - outer_start), abs(r - inner_start))
                         else:
                             edge_dist = min(abs(r - inner_end), abs(r - outer_end))
                         
-                        # Intensity profile
+                        # 强度曲线
                         profile = intensity * (1 - edge_dist / thickness)
                         
-                        # Add to all depths with scaling
-                        for d in range(depth):
-                            ring_diff = abs(d - depth // 2) / (depth // 2)
-                            scale = math.exp(-ring_diff * 2)
-                            sinogram[angle_idx, r_idx, d] += max(0, profile * scale)
+                        # 一次添加到所有深度
+                        if profile > 0:
+                            sinogram[angle_idx, r_idx, :] += profile * depth_falloff
                 
                 elif struct_type == 'disk':
-                    # Distance from projection line to center
+                    # 从投影线到中心的距离
                     dist_to_center = abs(center_proj - r)
                     
-                    # Check if current r is within the projected disk
+                    # 检查当前r是否在投影盘内
                     if dist_to_center <= radius:
-                        # Calculate profile based on distance from center
+                        # 根据到中心的距离计算曲线
                         edge_factor = 1 - (dist_to_center / radius)**2
                         profile = intensity * edge_factor
                         
-                        # Add to all depths with scaling
-                        for d in range(depth):
-                            ring_diff = abs(d - depth // 2) / (depth // 2)
-                            scale = math.exp(-ring_diff * 2)
-                            sinogram[angle_idx, r_idx, d] += profile * scale
+                        # 一次添加到所有深度
+                        sinogram[angle_idx, r_idx, :] += profile * depth_falloff
     
-    # Add background activity
-    background = torch.ones_like(sinogram) * 0.1
+    # 添加背景活动
+    background = np.ones_like(sinogram) * 0.1
     sinogram = sinogram + background
     
-    # Add noise
-    noise = torch.randn_like(sinogram) * noise_level
+    # 添加噪声
+    noise = np.random.normal(0, noise_level, sinogram.shape)
     sinogram = sinogram + noise
     
-    # Ensure non-negative values
-    sinogram = torch.clamp(sinogram, min=0.0)
+    # 确保非负值
+    sinogram = np.clip(sinogram, 0.0, None)
     
-    # Normalize
+    # 归一化
     sinogram = normalize_sinogram(sinogram)
     
-    return sinogram
+    # 确保float32类型
+    return sinogram.astype(np.float32)
 
-def create_incomplete_sinograms(sinogram, mask_angles=None, num_variants=1):
+def visualize_slice(args):
     """
-    Create incomplete sinograms by masking angular regions.
+    可视化正弦图的单个切片并保存到文件
     
     Args:
-        sinogram (torch.Tensor): Complete sinogram
-        mask_angles (list): List of (start_angle, end_angle) tuples in degrees
-        num_variants (int): Number of variants to generate
-        
-    Returns:
-        list: List of incomplete sinograms
+        args: 元组包含 (sinogram, slice_idx, title, output_path, cmap)
     """
-    if mask_angles is None:
-        # Default mask angles
-        mask_angles = [(30, 60), (45, 75), (135, 150), (20, 40)]
+    sinogram, slice_idx, title, output_path, cmap = args
     
-    incomplete_sinograms = []
+    plt.figure(figsize=(10, 8))
+    plt.imshow(sinogram[:, :, slice_idx], cmap=cmap, aspect='auto')
+    plt.title(title)
+    plt.colorbar()
+    plt.tight_layout()
+    plt.savefig(output_path)
+    plt.close()
     
-    for i in range(num_variants):
-        # Select a mask angle pair
-        start_angle, end_angle = mask_angles[i % len(mask_angles)]
-        
-        # Create mask
-        mask = create_angle_mask(sinogram.shape, start_angle, end_angle)
-        
-        # Apply mask
-        masked_sinogram = apply_mask(sinogram, mask)
-        
-        incomplete_sinograms.append((masked_sinogram, (start_angle, end_angle)))
-    
-    return incomplete_sinograms
+    return output_path
 
-def visualize_sinograms(complete_sinogram, incomplete_sinograms, output_dir, slice_indices=None):
+def visualize_parallel(sinogram, slice_indices, output_dir, prefix=""):
     """
-    Visualize complete and incomplete sinograms.
-    
-    Args:
-        complete_sinogram (torch.Tensor): Complete sinogram
-        incomplete_sinograms (list): List of (incomplete_sinogram, mask_angles) tuples
-        output_dir (str): Output directory
-        slice_indices (list): List of slice indices to visualize
+    使用多进程并行可视化正弦图切片
     """
     os.makedirs(output_dir, exist_ok=True)
     
-    if slice_indices is None:
-        # Select some slice indices
-        depth = complete_sinogram.shape[2]
-        slice_indices = [0, depth//4, depth//2, 3*depth//4, depth-1]
-        slice_indices = [min(i, depth-1) for i in slice_indices]
+    # 准备参数
+    viz_args = []
+    for slice_idx in slice_indices:
+        output_path = os.path.join(output_dir, f"{prefix}sinogram_slice_{slice_idx}.png")
+        title = f"{prefix.capitalize()}Sinogram (Slice {slice_idx})"
+        viz_args.append((sinogram, slice_idx, title, output_path, 'hot'))
     
-    # Visualize complete sinogram
-    for i, slice_idx in enumerate(slice_indices):
-        plt.figure(figsize=(10, 8))
-        plt.subplot(len(incomplete_sinograms) + 1, 1, 1)
-        plt.imshow(complete_sinogram[:, :, slice_idx].cpu().numpy(), cmap='hot', aspect='auto')
-        plt.title(f"Complete Sinogram (Slice {slice_idx})")
-        plt.colorbar()
+    # 使用进程池并行处理可视化
+    with ProcessPoolExecutor(max_workers=min(len(slice_indices), os.cpu_count())) as executor:
+        futures = [executor.submit(visualize_slice, arg) for arg in viz_args]
         
-        # Visualize incomplete sinograms
-        for j, (masked_sino, mask_angles) in enumerate(incomplete_sinograms):
-            plt.subplot(len(incomplete_sinograms) + 1, 1, j + 2)
-            plt.imshow(masked_sino[:, :, slice_idx].cpu().numpy(), cmap='hot', aspect='auto')
-            plt.title(f"Masked Sinogram ({mask_angles[0]}-{mask_angles[1]}°)")
-            plt.colorbar()
+        # 等待所有可视化完成
+        for future in as_completed(futures):
+            # 这将引发执行期间发生的任何异常
+            try:
+                path = future.result()
+                print(f"已保存: {path}")
+            except Exception as e:
+                print(f"可视化出错: {e}")
+
+def generate_sample(args):
+    """
+    生成单个样本，用于并行处理
+    
+    Args:
+        args: 元组包含 (idx, is_train, pattern, noise_level, mask, output_dir, visualize)
+    
+    Returns:
+        元组 (idx, complete_path, incomplete_path)
+    """
+    idx, is_train, pattern, noise_level, mask, output_dir, visualize = args
+    
+    # 确定输出路径
+    target_dir = os.path.join(output_dir, "train" if is_train else "test")
+    
+    # 为每个样本使用不同种子
+    seed = idx * 100 if is_train else (idx + 1) * 1000 + 100
+    
+    # 选择生成器函数
+    generator_func = generate_brain_like_sinogram if pattern == "brain" else generate_phantom_sinogram
+    
+    try:
+        # 生成完整正弦图
+        complete_sinogram = generator_func(
+            HEIGHT, WIDTH, DEPTH, 
+            seed=seed,
+            noise_level=noise_level
+        )
         
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f"sinogram_comparison_slice_{slice_idx}.png"))
-        plt.close()
+        # 生成不完整正弦图
+        incomplete_sinogram = apply_mask(complete_sinogram, mask)
+        
+        # 保存为.npy格式
+        complete_path = os.path.join(target_dir, f"complete_{idx+1}.npy")
+        incomplete_path = os.path.join(target_dir, f"incomplete_{idx+1}.npy")
+        
+        np.save(complete_path, complete_sinogram)
+        np.save(incomplete_path, incomplete_sinogram)
+        
+        # 可视化特定样本
+        if visualize and ((is_train and (idx == 0 or idx == 49 or idx == 99)) or 
+                          (not is_train and idx == 0)):
+            vis_dir = os.path.join(output_dir, "visualizations", 
+                                   f"{'train' if is_train else 'test'}_sample_{idx+1}")
+            
+            # 选择可视化切片
+            slice_indices = [0, DEPTH//8, DEPTH//4, DEPTH//2, 3*DEPTH//4, DEPTH-1]
+            slice_indices = [min(j, DEPTH-1) for j in slice_indices]
+            
+            # 并行生成可视化
+            visualize_parallel(complete_sinogram, slice_indices, vis_dir, prefix="complete_")
+            visualize_parallel(incomplete_sinogram, slice_indices, vis_dir, prefix="incomplete_")
+        
+        return idx, complete_path, incomplete_path
+    
+    except Exception as e:
+        print(f"生成样本 {idx+1} 出错: {e}")
+        return idx, None, None
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate synthetic sinogram data for PET reconstruction")
-    parser.add_argument("--output_dir", type=str, default="./data/synthetic",
-                       help="Output directory for generated data")
-    parser.add_argument("--height", type=int, default=180,
-                       help="Number of angular samples")
-    parser.add_argument("--width", type=int, default=256,
-                       help="Number of radial samples")
-    parser.add_argument("--depth", type=int, default=128,
-                       help="Number of planes")
-    parser.add_argument("--block_size", type=int, default=32,
-                       help="Block size for data division")
-    parser.add_argument("--noise_level", type=float, default=0.02,
-                       help="Noise level for synthetic data")
+    parser = argparse.ArgumentParser(description="生成特定尺寸的合成正弦图数据集")
+    parser.add_argument("--output_dir", type=str, default="./data/specific",
+                       help="输出目录")
     parser.add_argument("--pattern", type=str, default="brain",
-                       choices=["phantom", "rings", "brain"],
-                       help="Pattern to generate")
+                       choices=["phantom", "brain"],
+                       help="生成模式")
+    parser.add_argument("--noise_level", type=float, default=0.02,
+                       help="噪声级别")
+    parser.add_argument("--mask_angle_start", type=float, default=30,
+                       help="掩码起始角度（度）")
+    parser.add_argument("--mask_angle_end", type=float, default=60,
+                       help="掩码结束角度（度）")
+    parser.add_argument("--visualize", action="store_true", default=True,
+                       help="生成可视化")
+    parser.add_argument("--num_processes", type=int, default=None,
+                       help="用于数据生成的进程数，默认为CPU核心数")
     
     args = parser.parse_args()
     
-    # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    # 固定参数
+    num_train = 100
+    num_test = 10
     
-    print(f"Generating synthetic sinogram data with shape: ({args.height}, {args.width}, {args.depth})")
+    # 设置进程数
+    num_processes = args.num_processes if args.num_processes else multiprocessing.cpu_count()
+    print(f"使用 {num_processes} 个进程进行数据生成")
     
-    # Generate complete sinogram based on selected pattern
-    if args.pattern == "phantom":
-        complete_sinogram = generate_phantom_sinogram(
-            args.height, args.width, args.depth, noise_level=args.noise_level
-        )
-    elif args.pattern == "rings":
-        complete_sinogram = generate_ring_data(
-            args.height, args.width, args.depth, noise_level=args.noise_level
-        )
-    else:  # brain
-        complete_sinogram = generate_brain_like_sinogram(
-            args.height, args.width, args.depth, noise_level=args.noise_level
-        )
+    # 创建输出目录
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
     
-    print(f"Generated complete sinogram with shape: {complete_sinogram.shape}")
-    
-    # Save complete sinogram
-    torch.save(complete_sinogram, os.path.join(args.output_dir, "complete_sinogram.pt"))
-    print(f"Saved complete sinogram to {os.path.join(args.output_dir, 'complete_sinogram.pt')}")
-    
-    # Create visualization directory
-    vis_dir = os.path.join(args.output_dir, "visualizations")
-    os.makedirs(vis_dir, exist_ok=True)
-    
-    # Visualize slices of the complete sinogram
-    depth = complete_sinogram.shape[2]
-    slice_indices = [0, depth//4, depth//2, 3*depth//4, depth-1]
-    slice_indices = [min(i, depth-1) for i in slice_indices]
-    
-    for slice_idx in slice_indices:
-        plt.figure(figsize=(10, 8))
-        plt.imshow(complete_sinogram[:, :, slice_idx].numpy(), cmap='hot', aspect='auto')
-        plt.title(f"Complete Sinogram (Slice {slice_idx})")
-        plt.colorbar()
-        plt.tight_layout()
-        plt.savefig(os.path.join(vis_dir, f"sinogram_slice_{slice_idx}.png"))
-        plt.close()
-    
-    print(f"Saved visualizations to {vis_dir}")
-    
-    # Create training and testing datasets using block division
-    train_dir = os.path.join(args.output_dir, "train")
-    test_dir = os.path.join(args.output_dir, "test")
+    train_dir = os.path.join(output_dir, "train")
+    test_dir = os.path.join(output_dir, "test")
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
     
-    # Randomly split the sinogram for training and testing
-    indices = np.random.permutation(depth)
-    train_indices = indices[:int(0.8 * depth)]
-    test_indices = indices[int(0.8 * depth):]
+    # 创建掩码（所有图像使用相同的掩码）
+    mask = create_angle_mask(
+        (HEIGHT, WIDTH, DEPTH), 
+        args.mask_angle_start, 
+        args.mask_angle_end
+    )
     
-    # Create training dataset
-    train_complete = complete_sinogram[:, :, train_indices]
-    torch.save(train_complete, os.path.join(train_dir, "complete_sinogram.pt"))
+    start_time = time.time()
+    print(f"开始生成数据集，训练: {num_train}个样本，测试: {num_test}个样本")
+    print(f"图像尺寸: ({HEIGHT}, {WIDTH}, {DEPTH})")
     
-    # Create testing dataset
-    test_complete = complete_sinogram[:, :, test_indices]
-    torch.save(test_complete, os.path.join(test_dir, "complete_sinogram.pt"))
+    # 准备训练样本参数
+    train_args = [(i, True, args.pattern, args.noise_level, mask, output_dir, args.visualize) 
+                 for i in range(num_train)]
     
-    # Create blocks for training and testing
-    block_size = min(args.block_size, depth)
+    # 准备测试样本参数
+    test_args = [(i, False, args.pattern, args.noise_level, mask, output_dir, args.visualize) 
+                for i in range(num_test)]
     
-    # Create and save blocks for training
-    train_blocks = []
-    for i in range(0, train_complete.shape[2], block_size):
-        end_idx = min(i + block_size, train_complete.shape[2])
-        block = train_complete[:, :, i:end_idx]
+    # 合并所有参数
+    all_args = train_args + test_args
+    
+    # 使用进程池并行生成所有样本
+    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+        # 提交所有任务
+        futures = [executor.submit(generate_sample, arg) for arg in all_args]
         
-        # Pad if needed
-        if block.shape[2] < block_size:
-            padded_block = torch.zeros(
-                (train_complete.shape[0], train_complete.shape[1], block_size),
-                dtype=train_complete.dtype
-            )
-            padded_block[:, :, :block.shape[2]] = block
-            block = padded_block
-        
-        train_blocks.append(block)
-        torch.save(block, os.path.join(train_dir, f"block_{i//block_size+1}.pt"))
+        # 显示进度条
+        with tqdm(total=len(all_args), desc="生成数据") as pbar:
+            for future in as_completed(futures):
+                idx, complete_path, incomplete_path = future.result()
+                pbar.update(1)
     
-    # Create and save blocks for testing
-    test_blocks = []
-    for i in range(0, test_complete.shape[2], block_size):
-        end_idx = min(i + block_size, test_complete.shape[2])
-        block = test_complete[:, :, i:end_idx]
-        
-        # Pad if needed
-        if block.shape[2] < block_size:
-            padded_block = torch.zeros(
-                (test_complete.shape[0], test_complete.shape[1], block_size),
-                dtype=test_complete.dtype
-            )
-            padded_block[:, :, :block.shape[2]] = block
-            block = padded_block
-        
-        test_blocks.append(block)
-        torch.save(block, os.path.join(test_dir, f"block_{i//block_size+1}.pt"))
-    
-    print(f"Created {len(train_blocks)} training blocks and {len(test_blocks)} testing blocks")
-    print(f"Saved training blocks to {train_dir}")
-    print(f"Saved testing blocks to {test_dir}")
-    
-    print("Done!")
+    # 记录时间和结果
+    total_time = time.time() - start_time
+    print(f"\n完成！总处理时间：{total_time:.2f}秒")
+    print(f"数据保存到：{output_dir}")
+    print(f"- 训练样本：{num_train}个（在{train_dir}）")
+    print(f"- 测试样本：{num_test}个（在{test_dir}）")
+    print("所有文件使用.npy格式保存，数据类型为float32")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # Windows下多进程支持
     main()
