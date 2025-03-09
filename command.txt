@@ -1,0 +1,7 @@
+python train_with_generated_data.py \
+    --data_dir ./data/pet_dataset \
+    --output_dir ./outputs \
+    --batch_size 1 \
+    --num_epochs 30
+
+    /mnt/d/fyq/sinogram/reconstruction_npy_full_train/2000000000/listmode_i/sinogram_incomplete

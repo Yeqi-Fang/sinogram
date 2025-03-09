@@ -70,12 +70,32 @@ class SinogramNpyDataset(Dataset):
         
         return incomplete_sinogram, complete_sinogram
 
-# 训练函数
-def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
+# 混合精度训练函数
+def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, amp_enabled=True):
+    """
+    使用混合精度训练一个epoch
+    
+    Args:
+        model: 模型
+        dataloader: 数据加载器
+        criterion: 损失函数
+        optimizer: 优化器
+        device: 设备
+        epoch: 当前训练轮次
+        amp_enabled: 是否启用混合精度训练
+    
+    Returns:
+        损失和评估指标的平均值
+    """
+    from torch.cuda.amp import autocast, GradScaler
+    
     model.train()
     losses = AverageMeter()
     psnr_meter = AverageMeter()
     ssim_meter = AverageMeter()
+    
+    # 初始化梯度缩放器，用于混合精度训练
+    scaler = GradScaler(enabled=amp_enabled)
     
     with tqdm(dataloader, desc=f"Epoch {epoch+1}") as pbar:
         for inputs, targets in pbar:
@@ -86,26 +106,44 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch):
             # 清零梯度
             optimizer.zero_grad()
             
-            # 前向传播
-            outputs = model(inputs)
+            # 使用混合精度进行前向传播和损失计算
+            with autocast(enabled=amp_enabled):
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
             
-            # 计算损失
-            loss = criterion(outputs, targets)
-            
-            # 反向传播和优化
-            loss.backward()
-            optimizer.step()
+            # 使用梯度缩放器进行反向传播和优化
+            if amp_enabled:
+                # 缩放损失并反向传播
+                scaler.scale(loss).backward()
+                # 缩放优化器的步骤
+                scaler.step(optimizer)
+                # 更新缩放器
+                scaler.update()
+            else:
+                # 常规的反向传播和优化
+                loss.backward()
+                optimizer.step()
             
             # 更新统计信息
             batch_size = inputs.size(0)
             losses.update(loss.item(), batch_size)
             
-            # 计算指标
+            # 计算指标 (在no_grad上下文中使用FP32精度)
             with torch.no_grad():
-                psnr_val = calculate_psnr(outputs.detach(), targets)
-                ssim_val = calculate_ssim(outputs.detach(), targets)
+                # 对于指标计算，我们使用CPU并将数据转换为float32以确保准确性
+                outputs_for_metrics = outputs.detach().cpu()
+                targets_for_metrics = targets.cpu()
+                
+                psnr_val = calculate_psnr(outputs_for_metrics, targets_for_metrics)
+                ssim_val = calculate_ssim(outputs_for_metrics, targets_for_metrics)
+                
                 psnr_meter.update(psnr_val, batch_size)
                 ssim_meter.update(ssim_val, batch_size)
+            
+            # 释放内存
+            if amp_enabled:
+                # 清除缓存，释放显存
+                torch.cuda.empty_cache()
             
             # 更新进度条
             pbar.set_postfix({
@@ -381,7 +419,7 @@ def main():
     for epoch in range(args.num_epochs):
         # 训练一个轮次
         train_loss, train_psnr, train_ssim = train_one_epoch(
-            model, train_loader, criterion, optimizer, device, epoch
+            model, train_loader, criterion, optimizer, device, epoch, amp_enabled=True
         )
         train_losses.append(train_loss)
         train_metrics.append({'psnr': train_psnr, 'ssim': train_ssim})
