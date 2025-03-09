@@ -54,8 +54,8 @@ project/
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/incomplete-ring-pet.git
-cd incomplete-ring-pet
+git clone https://github.com/Yeqi-Fang/sinogram.git
+cd sinogram
 
 # Create a virtual environment (optional)
 python -m venv venv
