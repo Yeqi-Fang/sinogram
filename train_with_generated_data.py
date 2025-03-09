@@ -18,14 +18,20 @@ from pathlib import Path
 from models.sinogram_transformer import SinogramTransformer
 from utils.metrics import calculate_psnr, calculate_ssim, calculate_metrics, AverageMeter
 
-# 数据集类定义
+import os
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+from tqdm import tqdm
+
 class SinogramNpyDataset(Dataset):
     """
     用于处理.npy格式正弦图数据的数据集类
+    预加载所有数据到内存以提高训练速度
     """
     def __init__(self, data_dir, is_train=True, transform=None):
         """
-        初始化数据集
+        初始化数据集，预加载所有数据到内存
         
         Args:
             data_dir (str): 数据目录
@@ -47,21 +53,50 @@ class SinogramNpyDataset(Dataset):
         # 确保文件数量一致
         assert len(self.complete_files) == len(self.incomplete_files), \
             f"完整文件数量({len(self.complete_files)})与不完整文件数量({len(self.incomplete_files)})不匹配"
+            
+        print(f"找到 {len(self.complete_files)} 对{'训练' if is_train else '测试'}数据文件")
+        print("开始预加载所有数据到内存...")
+        
+        # 预加载所有数据到内存
+        self.complete_sinograms = []
+        self.incomplete_sinograms = []
+        
+        for i in tqdm(range(len(self.complete_files)), desc=f"预加载{'训练' if is_train else '测试'}数据"):
+            complete_path = os.path.join(self.base_dir, self.complete_files[i])
+            incomplete_path = os.path.join(self.base_dir, self.incomplete_files[i])
+            
+            try:
+                # 加载数据
+                complete_sinogram = np.load(complete_path)
+                incomplete_sinogram = np.load(incomplete_path)
+                
+                # 转换为PyTorch张量
+                complete_sinogram = torch.from_numpy(complete_sinogram).float()
+                incomplete_sinogram = torch.from_numpy(incomplete_sinogram).float()
+                
+                # 存储到内存
+                self.complete_sinograms.append(complete_sinogram)
+                self.incomplete_sinograms.append(incomplete_sinogram)
+                
+                # 打印第一个样本的形状作为参考
+                if i == 0:
+                    print(f"数据形状示例 - 完整: {complete_sinogram.shape}, 不完整: {incomplete_sinogram.shape}")
+                    
+            except Exception as e:
+                print(f"加载文件时出错 ({complete_path} 或 {incomplete_path}): {e}")
+                # 添加一个空占位符
+                self.complete_sinograms.append(torch.zeros((112, 225, 1024), dtype=torch.float32))
+                self.incomplete_sinograms.append(torch.zeros((112, 225, 1024), dtype=torch.float32))
+        
+        print(f"成功预加载 {len(self.complete_sinograms)} 对数据到内存")
     
     def __len__(self):
-        return len(self.complete_files)
+        return len(self.complete_sinograms)
     
     def __getitem__(self, idx):
-        # 加载完整和不完整的正弦图
-        complete_path = os.path.join(self.base_dir, self.complete_files[idx])
-        incomplete_path = os.path.join(self.base_dir, self.incomplete_files[idx])
-        
-        complete_sinogram = np.load(complete_path)
-        incomplete_sinogram = np.load(incomplete_path)
-        
-        # 转换为PyTorch张量
-        complete_sinogram = torch.from_numpy(complete_sinogram).float()
-        incomplete_sinogram = torch.from_numpy(incomplete_sinogram).float()
+        # 直接从内存获取数据
+        complete_sinogram = self.complete_sinograms[idx]
+        incomplete_sinogram = self.incomplete_sinograms[idx]
         
         # 应用变换（如果有）
         if self.transform:
