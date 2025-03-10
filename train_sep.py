@@ -26,10 +26,11 @@ import math
 
 class BlockwiseSinogramDataset(Dataset):
     """
-    将正弦图数据分块处理的数据集类
+    将正弦图数据分块处理的数据集类，并预加载所有数据到内存
     每个(182, 365, 1764)的sinogram被拆分成42个(182, 365, 42)的块
     """
-    def __init__(self, data_dir, is_train=True, transform=None, blocks_count=42):
+    def __init__(self, data_dir, is_train=True, transform=None, blocks_count=42, 
+                 use_half_precision=True, preload=True, max_items=None):
         """
         初始化数据集
         
@@ -38,11 +39,16 @@ class BlockwiseSinogramDataset(Dataset):
             is_train (bool): 是否为训练集
             transform (callable, optional): 可选的数据转换
             blocks_count (int): 要拆分成的块数量
+            use_half_precision (bool): 是否使用半精度(float16)以节省内存
+            preload (bool): 是否预加载所有数据到内存
+            max_items (int, optional): 最大加载项目数，用于限制内存使用
         """
         self.data_dir = data_dir
         self.is_train = is_train
         self.transform = transform
         self.blocks_count = blocks_count
+        self.use_half_precision = use_half_precision
+        self.preload = preload
         
         # 确定加载的子目录
         subset_dir = "train" if is_train else "test"
@@ -55,6 +61,11 @@ class BlockwiseSinogramDataset(Dataset):
         # 确保文件数量一致
         assert len(self.complete_files) == len(self.incomplete_files), \
             f"完整文件数量({len(self.complete_files)})与不完整文件数量({len(self.incomplete_files)})不匹配"
+        
+        # 限制加载项目数
+        if max_items is not None and max_items < len(self.complete_files):
+            self.complete_files = self.complete_files[:max_items]
+            self.incomplete_files = self.incomplete_files[:max_items]
             
         print(f"找到 {len(self.complete_files)} 对{'训练' if is_train else '测试'}数据文件")
         
@@ -74,54 +85,141 @@ class BlockwiseSinogramDataset(Dataset):
                 
             print(f"将拆分为 {blocks_count} 个块，每个块包含 {self.slices_per_block} 个切片")
         
+        # 预加载所有数据到内存
+        self.preloaded_data = []
+        
+        if self.preload:
+            print(f"开始预加载所有数据到内存{' (使用半精度)' if use_half_precision else ''}...")
+            
+            # 估计内存使用量
+            bytes_per_value = 2 if use_half_precision else 4
+            single_item_bytes = self.data_shape[0] * self.data_shape[1] * self.data_shape[2] * bytes_per_value * 2  # 完整和不完整各一份
+            total_memory_gb = (single_item_bytes * len(self.complete_files)) / (1024**3)
+            
+            print(f"预计内存使用: {total_memory_gb:.2f} GB")
+            
+            for idx in tqdm(range(len(self.complete_files)), desc="预加载数据"):
+                # 获取文件路径
+                complete_path = os.path.join(self.base_dir, self.complete_files[idx])
+                incomplete_path = os.path.join(self.base_dir, self.incomplete_files[idx])
+                
+                # 加载数据
+                complete_data = np.load(complete_path)
+                incomplete_data = np.load(incomplete_path)
+                
+                # 将数据拆分成块
+                complete_blocks = []
+                incomplete_blocks = []
+                
+                for i in range(self.blocks_count):
+                    start_slice = i * self.slices_per_block
+                    end_slice = min((i + 1) * self.slices_per_block, self.depth)
+                    
+                    # 提取当前块
+                    complete_block = complete_data[:, :, start_slice:end_slice]
+                    incomplete_block = incomplete_data[:, :, start_slice:end_slice]
+                    
+                    # 确保所有块大小一致 (填充最后一个块如果需要)
+                    if complete_block.shape[2] < self.slices_per_block:
+                        pad_width = self.slices_per_block - complete_block.shape[2]
+                        complete_block = np.pad(complete_block, ((0, 0), (0, 0), (0, pad_width)), 'constant')
+                        incomplete_block = np.pad(incomplete_block, ((0, 0), (0, 0), (0, pad_width)), 'constant')
+                    
+                    # 转换为张量
+                    complete_block = torch.from_numpy(complete_block)
+                    incomplete_block = torch.from_numpy(incomplete_block)
+                    
+                    # 使用半精度以节省内存
+                    if use_half_precision:
+                        complete_block = complete_block.half()
+                        incomplete_block = incomplete_block.half()
+                    else:
+                        complete_block = complete_block.float()
+                        incomplete_block = incomplete_block.float()
+                    
+                    complete_blocks.append(complete_block)
+                    incomplete_blocks.append(incomplete_block)
+                
+                # 将块组合成批量
+                complete_blocks = torch.stack(complete_blocks)  # [blocks_count, H, W, slices_per_block]
+                incomplete_blocks = torch.stack(incomplete_blocks)  # [blocks_count, H, W, slices_per_block]
+                
+                # 存储到内存
+                self.preloaded_data.append((incomplete_blocks, complete_blocks))
+            
+            print(f"已成功预加载 {len(self.preloaded_data)} 对数据到内存")
+        
     def __len__(self):
         return len(self.complete_files)
     
     def __getitem__(self, idx):
-        # 获取文件路径
-        complete_path = os.path.join(self.base_dir, self.complete_files[idx])
-        incomplete_path = os.path.join(self.base_dir, self.incomplete_files[idx])
-        
-        # 加载数据
-        complete_data = np.load(complete_path)
-        incomplete_data = np.load(incomplete_path)
-        
-        # 将数据拆分成块
-        complete_blocks = []
-        incomplete_blocks = []
-        
-        for i in range(self.blocks_count):
-            start_slice = i * self.slices_per_block
-            end_slice = min((i + 1) * self.slices_per_block, self.depth)
+        if self.preload and idx < len(self.preloaded_data):
+            # 从内存中获取预加载的数据
+            incomplete_blocks, complete_blocks = self.preloaded_data[idx]
             
-            # 提取当前块
-            complete_block = complete_data[:, :, start_slice:end_slice]
-            incomplete_block = incomplete_data[:, :, start_slice:end_slice]
-            
-            # 确保所有块大小一致 (填充最后一个块如果需要)
-            if complete_block.shape[2] < self.slices_per_block:
-                pad_width = self.slices_per_block - complete_block.shape[2]
-                complete_block = np.pad(complete_block, ((0, 0), (0, 0), (0, pad_width)), 'constant')
-                incomplete_block = np.pad(incomplete_block, ((0, 0), (0, 0), (0, pad_width)), 'constant')
-            
-            # 转换为张量
-            complete_block = torch.from_numpy(complete_block).float()
-            incomplete_block = torch.from_numpy(incomplete_block).float()
+            # 如果使用了半精度，但需要返回float32，则转换
+            if self.use_half_precision and not any(p.dtype == torch.float16 for p in next(iter(self.transform.parameters())) if hasattr(self.transform, 'parameters')):
+                incomplete_blocks = incomplete_blocks.float()
+                complete_blocks = complete_blocks.float()
             
             # 应用变换（如果有）
             if self.transform:
-                complete_block = self.transform(complete_block)
-                incomplete_block = self.transform(incomplete_block)
+                # 注意：如果变换需要应用于每个块，需要循环处理
+                for i in range(self.blocks_count):
+                    if hasattr(self.transform, '__iter__'):
+                        for t in self.transform:
+                            incomplete_blocks[i] = t(incomplete_blocks[i])
+                            complete_blocks[i] = t(complete_blocks[i])
+                    else:
+                        incomplete_blocks[i] = self.transform(incomplete_blocks[i])
+                        complete_blocks[i] = self.transform(complete_blocks[i])
             
-            complete_blocks.append(complete_block)
-            incomplete_blocks.append(incomplete_block)
-        
-        # 将块组合成批量
-        complete_blocks = torch.stack(complete_blocks)  # [blocks_count, H, W, slices_per_block]
-        incomplete_blocks = torch.stack(incomplete_blocks)  # [blocks_count, H, W, slices_per_block]
-        
-        return incomplete_blocks, complete_blocks
-
+            return incomplete_blocks, complete_blocks
+        else:
+            # 如果没有预加载，则从磁盘加载
+            # 获取文件路径
+            complete_path = os.path.join(self.base_dir, self.complete_files[idx])
+            incomplete_path = os.path.join(self.base_dir, self.incomplete_files[idx])
+            
+            # 加载数据
+            complete_data = np.load(complete_path)
+            incomplete_data = np.load(incomplete_path)
+            
+            # 将数据拆分成块
+            complete_blocks = []
+            incomplete_blocks = []
+            
+            for i in range(self.blocks_count):
+                start_slice = i * self.slices_per_block
+                end_slice = min((i + 1) * self.slices_per_block, self.depth)
+                
+                # 提取当前块
+                complete_block = complete_data[:, :, start_slice:end_slice]
+                incomplete_block = incomplete_data[:, :, start_slice:end_slice]
+                
+                # 确保所有块大小一致 (填充最后一个块如果需要)
+                if complete_block.shape[2] < self.slices_per_block:
+                    pad_width = self.slices_per_block - complete_block.shape[2]
+                    complete_block = np.pad(complete_block, ((0, 0), (0, 0), (0, pad_width)), 'constant')
+                    incomplete_block = np.pad(incomplete_block, ((0, 0), (0, 0), (0, pad_width)), 'constant')
+                
+                # 转换为张量
+                complete_block = torch.from_numpy(complete_block).float()
+                incomplete_block = torch.from_numpy(incomplete_block).float()
+                
+                # 应用变换（如果有）
+                if self.transform:
+                    complete_block = self.transform(complete_block)
+                    incomplete_block = self.transform(incomplete_block)
+                
+                complete_blocks.append(complete_block)
+                incomplete_blocks.append(incomplete_block)
+            
+            # 将块组合成批量
+            complete_blocks = torch.stack(complete_blocks)  # [blocks_count, H, W, slices_per_block]
+            incomplete_blocks = torch.stack(incomplete_blocks)  # [blocks_count, H, W, slices_per_block]
+            
+            return incomplete_blocks, complete_blocks
 # ---------------------------
 # 模型组件
 # ---------------------------
@@ -538,7 +636,10 @@ def main():
     train_dataset = BlockwiseSinogramDataset(
         args.data_dir, 
         is_train=True, 
-        blocks_count=args.block_size
+        blocks_count=args.block_size,
+        use_half_precision=True,  # 使用半精度减少内存占用
+        preload=True,             # 启用预加载
+        max_items=170             # 限制数据项数（可选）
     )
     
     # 分割训练集和验证集

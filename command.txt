@@ -16,7 +16,7 @@ python train_with_generated_data.py --data_dir ../2e9  --output_dir ./outputs --
     /mnt/d/fyq/sinogram/reconstruction_npy_full_train/2000000000/listmode_i/sinogram_incomplete
 
 
-python train_sep.py --data_dir ../2e9 --block_size 42 --batch_size 64 --accumulation_steps 4 --num_epochs 200 --init_features 32 --embed_dim 128 --num_heads 4 --transformer_layers 2 --output_dir ./outputs/blockwise
+python train_sep.py --data_dir /mnt/d/fyq/sinogram/2e9 --block_size 42 --batch_size 64 --accumulation_steps 4 --num_epochs 200 --init_features 32 --embed_dim 128 --num_heads 4 --transformer_layers 2 --output_dir ./outputs/blockwise
 
 D:
 cd fyq/sinogram/sinogram
