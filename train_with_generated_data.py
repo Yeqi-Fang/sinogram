@@ -110,7 +110,7 @@ class SparseSinogramDataset(Dataset):
     用于处理.npy格式正弦图数据的数据集类
     使用稀疏矩阵存储数据以减少内存占用
     """
-    def __init__(self, data_dir, is_train=True, transform=None, sparsity_threshold=0.7):
+    def __init__(self, data_dir, is_train=True, transform=None, sparsity_threshold=0.6):
         """
         初始化数据集，使用稀疏矩阵预加载数据到内存
         
@@ -521,7 +521,7 @@ def main():
     
     # 创建数据集
     train_dataset = SinogramNpyDataset(args.data_dir, is_train=True)
-    test_dataset = SparseSinogramDataset(args.data_dir, is_train=False)
+    # test_dataset = SinogramNpyDataset(args.data_dir, is_train=False)
     
     # 从训练集中分离验证集
     val_size = int(len(train_dataset) * args.val_split)
@@ -533,7 +533,7 @@ def main():
     
     print(f"Training set size: {train_size}")
     print(f"Validation set size: {val_size}")
-    print(f"Test set size: {len(test_dataset)}")
+    # print(f"Test set size: {len(test_dataset)}")
     
     # 创建数据加载器
     train_loader = DataLoader(
@@ -552,13 +552,13 @@ def main():
         pin_memory=True
     )
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
+    # test_loader = DataLoader(
+    #     test_dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=False,
+    #     num_workers=4,
+    #     pin_memory=True
+    # )
     
     # 初始化模型
     model = SinogramTransformer(
@@ -649,11 +649,11 @@ def main():
             }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
             
             # 保存样本预测
-            save_prediction_sample(
-                model, test_dataset, device, 
-                os.path.join(sample_dir, f'epoch_{epoch+1}'),
-                epoch
-            )
+            # save_prediction_sample(
+            #     model, test_dataset, device, 
+            #     os.path.join(sample_dir, f'epoch_{epoch+1}'),
+            #     epoch
+            # )
             
             # 绘制训练曲线
             plot_training_curves(
@@ -677,11 +677,11 @@ def main():
     }, os.path.join(checkpoint_dir, 'final_model.pth'))
     
     # 在测试集上评估
-    print("Evaluating on test set...")
-    test_loss, test_psnr, test_ssim = validate(
-        model, test_loader, criterion, device
-    )
-    print(f"Test Loss: {test_loss:.4f}, PSNR: {test_psnr:.2f}, SSIM: {test_ssim:.4f}")
+    # print("Evaluating on test set...")
+    # test_loss, test_psnr, test_ssim = validate(
+    #     model, test_loader, criterion, device
+    # )
+    # print(f"Test Loss: {test_loss:.4f}, PSNR: {test_psnr:.2f}, SSIM: {test_ssim:.4f}")
     
     # 保存最终训练曲线
     plot_training_curves(
