@@ -108,22 +108,22 @@ class SinogramNpyDataset(Dataset):
 class SparseSinogramDataset(Dataset):
     """
     用于处理.npy格式正弦图数据的数据集类
-    使用稀疏矩阵存储数据以减少内存占用
+    强制使用稀疏矩阵存储所有数据以最大程度减少内存占用
     """
-    def __init__(self, data_dir, is_train=True, transform=None, sparsity_threshold=0.6):
+    def __init__(self, data_dir, is_train=True, transform=None, return_dense=True):
         """
-        初始化数据集，使用稀疏矩阵预加载数据到内存
+        初始化数据集，强制使用稀疏矩阵预加载数据到内存
         
         Args:
             data_dir (str): 数据目录
             is_train (bool): 是否为训练集
             transform (callable, optional): 可选的数据转换
-            sparsity_threshold (float): 稀疏度阈值，超过此值时使用稀疏存储
+            return_dense (bool): 是否在__getitem__中返回密集张量，设为False可与支持稀疏张量的模型一起使用
         """
         self.data_dir = data_dir
         self.is_train = is_train
         self.transform = transform
-        self.sparsity_threshold = sparsity_threshold
+        self.return_dense = return_dense
         
         # 确定加载的子目录
         subset_dir = "train" if is_train else "test"
@@ -138,17 +138,18 @@ class SparseSinogramDataset(Dataset):
             f"完整文件数量({len(self.complete_files)})与不完整文件数量({len(self.incomplete_files)})不匹配"
             
         print(f"找到 {len(self.complete_files)} 对{'训练' if is_train else '测试'}数据文件")
-        print(f"开始预加载所有数据到内存（稀疏度阈值: {sparsity_threshold}）...")
+        print(f"开始预加载所有数据到内存（强制使用稀疏存储）...")
         
-        # 记录总内存节省
-        self.dense_size = 0
-        self.sparse_size = 0
-        self.sparse_count = 0
-        self.dense_count = 0
+        # 记录总内存统计
+        self.original_size = 0  # 原始数据大小（如果是密集存储）
+        self.sparse_size = 0    # 实际使用的稀疏存储大小
+        self.total_elements = 0 # 总元素数
+        self.nonzero_elements = 0 # 非零元素数
         
-        # 预加载所有数据到内存
-        self.complete_data = []
-        self.incomplete_data = []
+        # 预加载所有数据到内存（仅稀疏格式）
+        self.complete_sparse = []
+        self.incomplete_sparse = []
+        self.shapes = []  # 存储原始形状
         
         for i in tqdm(range(len(self.complete_files)), desc=f"预加载{'训练' if is_train else '测试'}数据"):
             complete_path = os.path.join(self.base_dir, self.complete_files[i])
@@ -159,98 +160,122 @@ class SparseSinogramDataset(Dataset):
                 complete_np = np.load(complete_path)
                 incomplete_np = np.load(incomplete_path)
                 
-                # 计算稀疏度（零值比例）
-                complete_sparsity = np.count_nonzero(complete_np == 0) / complete_np.size
-                incomplete_sparsity = np.count_nonzero(incomplete_np == 0) / incomplete_np.size
+                # 保存原始形状
+                self.shapes.append(complete_np.shape)
                 
-                # 根据稀疏度选择存储方式
-                complete_tensor, complete_is_sparse = self._convert_to_appropriate_format(
-                    complete_np, complete_sparsity)
-                incomplete_tensor, incomplete_is_sparse = self._convert_to_appropriate_format(
-                    incomplete_np, incomplete_sparsity)
+                # 统计非零元素数量
+                complete_nonzeros = np.count_nonzero(complete_np)
+                incomplete_nonzeros = np.count_nonzero(incomplete_np)
                 
-                # 存储到内存
-                self.complete_data.append((complete_tensor, complete_is_sparse))
-                self.incomplete_data.append((incomplete_tensor, incomplete_is_sparse))
+                # 更新统计信息
+                self.total_elements += complete_np.size + incomplete_np.size
+                self.nonzero_elements += complete_nonzeros + incomplete_nonzeros
+                self.original_size += (complete_np.size + incomplete_np.size) * 4  # 假设float32
+                
+                # 将数据转换为稀疏张量
+                complete_sparse = self._to_sparse_tensor(complete_np)
+                incomplete_sparse = self._to_sparse_tensor(incomplete_np)
+                
+                # 估计稀疏存储大小
+                complete_sparse_size = self._estimate_sparse_size(complete_sparse)
+                incomplete_sparse_size = self._estimate_sparse_size(incomplete_sparse)
+                self.sparse_size += complete_sparse_size + incomplete_sparse_size
+                
+                # 存储稀疏张量
+                self.complete_sparse.append(complete_sparse)
+                self.incomplete_sparse.append(incomplete_sparse)
                 
                 # 打印第一个样本的信息作为参考
                 if i == 0:
                     print(f"数据形状示例: {complete_np.shape}")
-                    print(f"完整数据稀疏度: {complete_sparsity:.2f}, 不完整数据稀疏度: {incomplete_sparsity:.2f}")
-                    if complete_is_sparse:
-                        print(f"完整数据使用稀疏存储，索引形状: {complete_tensor.indices().shape}")
-                    else:
-                        print(f"完整数据使用密集存储，数据类型: {complete_tensor.dtype}")
+                    print(f"稀疏存储信息:")
+                    print(f"  - 完整数据: 非零元素率 {complete_nonzeros/complete_np.size:.2%}")
+                    print(f"  - 不完整数据: 非零元素率 {incomplete_nonzeros/incomplete_np.size:.2%}")
+                    print(f"  - 索引形状: {complete_sparse.indices().shape}")
+                    print(f"  - 值数量: {complete_sparse.values().shape[0]}")
                     
             except Exception as e:
                 print(f"加载文件时出错 ({complete_path} 或 {incomplete_path}): {e}")
-                # 添加空占位符
-                shape = (112, 225, 1024)  # 默认形状
-                self.complete_data.append((torch.zeros(shape, dtype=torch.float16), False))
-                self.incomplete_data.append((torch.zeros(shape, dtype=torch.float16), False))
+                # 创建一个空的稀疏张量作为占位符
+                shape = (182, 365, 1764) if len(self.shapes) > 0 else (112, 225, 1024)  # 使用之前看到的形状或默认形状
+                empty_sparse = torch.sparse_coo_tensor(
+                    torch.LongTensor(np.zeros((3, 0))),  # 空索引
+                    torch.tensor([], dtype=torch.float16),  # 空值
+                    torch.Size(shape)
+                )
+                self.complete_sparse.append(empty_sparse)
+                self.incomplete_sparse.append(empty_sparse)
+                self.shapes.append(shape)
         
-        # 显示内存节省统计
-        if self.sparse_count > 0:
-            avg_savings_percent = (1 - self.sparse_size / self.dense_size) * 100 if self.dense_size > 0 else 0
-            print(f"数据存储统计:")
-            print(f"  - 稀疏张量: {self.sparse_count}个，估计内存: {self.sparse_size/1024/1024:.2f} MB")
-            print(f"  - 密集张量: {self.dense_count}个，估计内存: {self.dense_size/1024/1024:.2f} MB")
-            print(f"  - 总内存节省: {avg_savings_percent:.2f}%")
+        # 显示内存统计
+        sparsity = 1.0 - (self.nonzero_elements / self.total_elements) if self.total_elements > 0 else 0
+        savings = (1.0 - self.sparse_size / self.original_size) * 100 if self.original_size > 0 else 0
         
-        print(f"成功预加载 {len(self.complete_data)} 对数据到内存")
+        print(f"\n数据存储统计:")
+        print(f"  - 总元素数: {self.total_elements:,}")
+        print(f"  - 非零元素数: {self.nonzero_elements:,} ({(1-sparsity):.2%})")
+        print(f"  - 零元素数: {self.total_elements - self.nonzero_elements:,} ({sparsity:.2%})")
+        print(f"  - 原始数据大小(估计): {self.original_size/1024/1024:.2f} MB")
+        print(f"  - 稀疏存储大小(估计): {self.sparse_size/1024/1024:.2f} MB")
+        print(f"  - 内存节省: {savings:.2f}%")
+        
+        print(f"成功预加载 {len(self.complete_sparse)} 对数据到内存 (稀疏格式)")
     
-    def _convert_to_appropriate_format(self, numpy_array, sparsity):
-        """根据稀疏度选择合适的存储格式"""
-        # 如果数据足够稀疏，使用稀疏表示
-        if sparsity > self.sparsity_threshold:
-            # 获取非零元素的索引和值
-            indices = np.nonzero(numpy_array)
-            values = numpy_array[indices]
-            
-            # 创建稀疏张量
-            sparse_tensor = torch.sparse_coo_tensor(
-                torch.LongTensor(np.vstack(indices)), 
-                torch.tensor(values, dtype=torch.float16),
-                torch.Size(numpy_array.shape)
-            )
-            
-            # 估计内存占用
-            self.sparse_size += (len(values) * (2 + 2 * len(indices)))  # 值和索引的内存
-            self.sparse_count += 1
-            
-            return sparse_tensor, True
-        else:
-            # 使用半精度密集张量
-            dense_tensor = torch.tensor(numpy_array, dtype=torch.float16)
-            
-            # 估计内存占用
-            self.dense_size += numpy_array.size * 2  # float16占用2字节
-            self.dense_count += 1
-            
-            return dense_tensor, False
+    def _to_sparse_tensor(self, numpy_array):
+        """将NumPy数组转换为PyTorch稀疏张量"""
+        # 获取非零元素的索引和值
+        indices = np.nonzero(numpy_array)
+        values = numpy_array[indices]
+        
+        # 创建稀疏张量 (使用float16减少内存)
+        sparse_tensor = torch.sparse_coo_tensor(
+            torch.LongTensor(np.vstack(indices)), 
+            torch.tensor(values, dtype=torch.float16),
+            torch.Size(numpy_array.shape)
+        )
+        
+        return sparse_tensor
+    
+    def _estimate_sparse_size(self, sparse_tensor):
+        """估计稀疏张量占用的内存大小 (字节)"""
+        # 索引: int64 (8字节) * 维度数 * 非零元素数
+        indices_size = 8 * sparse_tensor.indices().shape[0] * sparse_tensor.indices().shape[1]
+        
+        # 值: float16 (2字节) * 非零元素数
+        values_size = 2 * sparse_tensor.values().shape[0]
+        
+        # 返回总大小 (字节)
+        return indices_size + values_size
     
     def __len__(self):
-        return len(self.complete_data)
+        return len(self.complete_sparse)
     
     def __getitem__(self, idx):
-        # 获取数据
-        complete_tensor, complete_is_sparse = self.complete_data[idx]
-        incomplete_tensor, incomplete_is_sparse = self.incomplete_data[idx]
+        # 获取对应的稀疏张量
+        complete_tensor = self.complete_sparse[idx]
+        incomplete_tensor = self.incomplete_sparse[idx]
         
-        # 如果是稀疏张量，转换为密集张量以便处理
-        if complete_is_sparse:
+        # 如果需要返回密集张量
+        if self.return_dense:
             complete_tensor = complete_tensor.to_dense()
-        if incomplete_is_sparse:
             incomplete_tensor = incomplete_tensor.to_dense()
-        
-        # 应用变换（如果有）
-        if self.transform:
-            complete_tensor = self.transform(complete_tensor)
-            incomplete_tensor = self.transform(incomplete_tensor)
-        
-        return incomplete_tensor.float(), complete_tensor.float()
-
-
+            
+            # 应用变换（如果有）
+            if self.transform:
+                complete_tensor = self.transform(complete_tensor)
+                incomplete_tensor = self.transform(incomplete_tensor)
+            
+            # 转换为float32返回给模型
+            return incomplete_tensor.float(), complete_tensor.float()
+        else:
+            # 直接返回稀疏张量 (某些模型可以直接处理稀疏张量)
+            # 注意：大多数模型和损失函数不支持稀疏输入，所以这个选项要谨慎使用
+            
+            # 由于稀疏张量不支持大多数变换，这里我们跳过transform
+            # 如果有变换需求，需要在模型内部处理
+            
+            # 转换为float32
+            return incomplete_tensor.float(), complete_tensor.float()
 # 混合精度训练函数
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, amp_enabled=True):
     """
@@ -520,7 +545,7 @@ def main():
     print(f"Using device: {device}")
     
     # 创建数据集
-    train_dataset = SinogramNpyDataset(args.data_dir, is_train=True)
+    train_dataset = SparseSinogramDataset(args.data_dir, is_train=True)
     # test_dataset = SinogramNpyDataset(args.data_dir, is_train=False)
     
     # 从训练集中分离验证集
@@ -649,11 +674,11 @@ def main():
             }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
             
             # 保存样本预测
-            # save_prediction_sample(
-            #     model, test_dataset, device, 
-            #     os.path.join(sample_dir, f'epoch_{epoch+1}'),
-            #     epoch
-            # )
+            save_prediction_sample(
+                model, val_dataset, device, 
+                os.path.join(sample_dir, f'epoch_{epoch+1}'),
+                epoch
+            )
             
             # 绘制训练曲线
             plot_training_curves(
