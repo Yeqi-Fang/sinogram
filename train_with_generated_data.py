@@ -27,7 +27,7 @@ from tqdm import tqdm
 class SinogramNpyDataset(Dataset):
     """
     用于处理.npy格式正弦图数据的数据集类
-    预加载所有数据到内存以提高训练速度
+    预加载所有数据到内存以提高训练速度，使用float16减少内存占用
     """
     def __init__(self, data_dir, is_train=True, transform=None):
         """
@@ -55,7 +55,7 @@ class SinogramNpyDataset(Dataset):
             f"完整文件数量({len(self.complete_files)})与不完整文件数量({len(self.incomplete_files)})不匹配"
             
         print(f"找到 {len(self.complete_files)} 对{'训练' if is_train else '测试'}数据文件")
-        print("开始预加载所有数据到内存...")
+        print("开始预加载所有数据到内存（使用float16减少内存占用）...")
         
         # 预加载所有数据到内存
         self.complete_sinograms = []
@@ -65,30 +65,25 @@ class SinogramNpyDataset(Dataset):
             complete_path = os.path.join(self.base_dir, self.complete_files[i])
             incomplete_path = os.path.join(self.base_dir, self.incomplete_files[i])
             
-            try:
-                # 加载数据
-                complete_sinogram = np.load(complete_path)
-                incomplete_sinogram = np.load(incomplete_path)
-                
-                # 转换为PyTorch张量
-                complete_sinogram = torch.from_numpy(complete_sinogram).float()
-                incomplete_sinogram = torch.from_numpy(incomplete_sinogram).float()
-                
-                # 存储到内存
-                self.complete_sinograms.append(complete_sinogram)
-                self.incomplete_sinograms.append(incomplete_sinogram)
-                
-                # 打印第一个样本的形状作为参考
-                if i == 0:
-                    print(f"数据形状示例 - 完整: {complete_sinogram.shape}, 不完整: {incomplete_sinogram.shape}")
+            # 加载数据
+            complete_sinogram = np.load(complete_path)
+            incomplete_sinogram = np.load(incomplete_path)
+            
+            # 转换为PyTorch张量并使用float16减少内存占用
+            complete_sinogram = torch.from_numpy(complete_sinogram).half()  # 使用half()而不是float()
+            incomplete_sinogram = torch.from_numpy(incomplete_sinogram).half()  # 使用half()而不是float()
+            
+            # 存储到内存
+            self.complete_sinograms.append(complete_sinogram)
+            self.incomplete_sinograms.append(incomplete_sinogram)
+            
+            # 打印第一个样本的形状和数据类型作为参考
+            if i == 0:
+                print(f"数据形状示例 - 完整: {complete_sinogram.shape}, 不完整: {incomplete_sinogram.shape}")
+                print(f"数据类型: {complete_sinogram.dtype}, 内存占用减少约50%")
                     
-            except Exception as e:
-                print(f"加载文件时出错 ({complete_path} 或 {incomplete_path}): {e}")
-                # 添加一个空占位符
-                self.complete_sinograms.append(torch.zeros((112, 225, 1024), dtype=torch.float32))
-                self.incomplete_sinograms.append(torch.zeros((112, 225, 1024), dtype=torch.float32))
         
-        print(f"成功预加载 {len(self.complete_sinograms)} 对数据到内存")
+        print(f"成功预加载 {len(self.complete_sinograms)} 对数据到内存（使用float16格式）")
     
     def __len__(self):
         return len(self.complete_sinograms)
@@ -375,7 +370,7 @@ def main():
     
     # 创建数据集
     train_dataset = SinogramNpyDataset(args.data_dir, is_train=True)
-    test_dataset = SinogramNpyDataset(args.data_dir, is_train=False)
+    # test_dataset = SinogramNpyDataset(args.data_dir, is_train=False)
     
     # 从训练集中分离验证集
     val_size = int(len(train_dataset) * args.val_split)
@@ -387,7 +382,7 @@ def main():
     
     print(f"Training set size: {train_size}")
     print(f"Validation set size: {val_size}")
-    print(f"Test set size: {len(test_dataset)}")
+    # print(f"Test set size: {len(test_dataset)}")
     
     # 创建数据加载器
     train_loader = DataLoader(
@@ -406,13 +401,13 @@ def main():
         pin_memory=True
     )
     
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
+    # test_loader = DataLoader(
+    #     test_dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=False,
+    #     num_workers=4,
+    #     pin_memory=True
+    # )
     
     # 初始化模型
     model = SinogramTransformer(
@@ -503,11 +498,11 @@ def main():
             }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
             
             # 保存样本预测
-            save_prediction_sample(
-                model, test_dataset, device, 
-                os.path.join(sample_dir, f'epoch_{epoch+1}'),
-                epoch
-            )
+            # save_prediction_sample(
+            #     model, test_dataset, device, 
+            #     os.path.join(sample_dir, f'epoch_{epoch+1}'),
+            #     epoch
+            # )
             
             # 绘制训练曲线
             plot_training_curves(
@@ -530,12 +525,12 @@ def main():
         'val_ssim': val_metrics[-1]['ssim']
     }, os.path.join(checkpoint_dir, 'final_model.pth'))
     
-    # 在测试集上评估
-    print("Evaluating on test set...")
-    test_loss, test_psnr, test_ssim = validate(
-        model, test_loader, criterion, device
-    )
-    print(f"Test Loss: {test_loss:.4f}, PSNR: {test_psnr:.2f}, SSIM: {test_ssim:.4f}")
+    # # 在测试集上评估
+    # print("Evaluating on test set...")
+    # test_loss, test_psnr, test_ssim = validate(
+    #     model, test_loader, criterion, device
+    # )
+    # print(f"Test Loss: {test_loss:.4f}, PSNR: {test_psnr:.2f}, SSIM: {test_ssim:.4f}")
     
     # 保存最终训练曲线
     plot_training_curves(
