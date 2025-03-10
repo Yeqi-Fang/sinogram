@@ -93,12 +93,163 @@ class SinogramNpyDataset(Dataset):
         complete_sinogram = self.complete_sinograms[idx]
         incomplete_sinogram = self.incomplete_sinograms[idx]
         
+        # 转换回float32以匹配模型
+        complete_sinogram = complete_sinogram.float()
+        incomplete_sinogram = incomplete_sinogram.float()
+        
         # 应用变换（如果有）
         if self.transform:
             complete_sinogram = self.transform(complete_sinogram)
             incomplete_sinogram = self.transform(incomplete_sinogram)
         
         return incomplete_sinogram, complete_sinogram
+
+
+class SparseSinogramDataset(Dataset):
+    """
+    用于处理.npy格式正弦图数据的数据集类
+    使用稀疏矩阵存储数据以减少内存占用
+    """
+    def __init__(self, data_dir, is_train=True, transform=None, sparsity_threshold=0.7):
+        """
+        初始化数据集，使用稀疏矩阵预加载数据到内存
+        
+        Args:
+            data_dir (str): 数据目录
+            is_train (bool): 是否为训练集
+            transform (callable, optional): 可选的数据转换
+            sparsity_threshold (float): 稀疏度阈值，超过此值时使用稀疏存储
+        """
+        self.data_dir = data_dir
+        self.is_train = is_train
+        self.transform = transform
+        self.sparsity_threshold = sparsity_threshold
+        
+        # 确定加载的子目录
+        subset_dir = "train" if is_train else "test"
+        self.base_dir = os.path.join(data_dir, subset_dir)
+        
+        # 获取完整和不完整正弦图的文件列表
+        self.complete_files = sorted([f for f in os.listdir(self.base_dir) if f.startswith("complete_")])
+        self.incomplete_files = sorted([f for f in os.listdir(self.base_dir) if f.startswith("incomplete_")])
+        
+        # 确保文件数量一致
+        assert len(self.complete_files) == len(self.incomplete_files), \
+            f"完整文件数量({len(self.complete_files)})与不完整文件数量({len(self.incomplete_files)})不匹配"
+            
+        print(f"找到 {len(self.complete_files)} 对{'训练' if is_train else '测试'}数据文件")
+        print(f"开始预加载所有数据到内存（稀疏度阈值: {sparsity_threshold}）...")
+        
+        # 记录总内存节省
+        self.dense_size = 0
+        self.sparse_size = 0
+        self.sparse_count = 0
+        self.dense_count = 0
+        
+        # 预加载所有数据到内存
+        self.complete_data = []
+        self.incomplete_data = []
+        
+        for i in tqdm(range(len(self.complete_files)), desc=f"预加载{'训练' if is_train else '测试'}数据"):
+            complete_path = os.path.join(self.base_dir, self.complete_files[i])
+            incomplete_path = os.path.join(self.base_dir, self.incomplete_files[i])
+            
+            try:
+                # 加载数据
+                complete_np = np.load(complete_path)
+                incomplete_np = np.load(incomplete_path)
+                
+                # 计算稀疏度（零值比例）
+                complete_sparsity = np.count_nonzero(complete_np == 0) / complete_np.size
+                incomplete_sparsity = np.count_nonzero(incomplete_np == 0) / incomplete_np.size
+                
+                # 根据稀疏度选择存储方式
+                complete_tensor, complete_is_sparse = self._convert_to_appropriate_format(
+                    complete_np, complete_sparsity)
+                incomplete_tensor, incomplete_is_sparse = self._convert_to_appropriate_format(
+                    incomplete_np, incomplete_sparsity)
+                
+                # 存储到内存
+                self.complete_data.append((complete_tensor, complete_is_sparse))
+                self.incomplete_data.append((incomplete_tensor, incomplete_is_sparse))
+                
+                # 打印第一个样本的信息作为参考
+                if i == 0:
+                    print(f"数据形状示例: {complete_np.shape}")
+                    print(f"完整数据稀疏度: {complete_sparsity:.2f}, 不完整数据稀疏度: {incomplete_sparsity:.2f}")
+                    if complete_is_sparse:
+                        print(f"完整数据使用稀疏存储，索引形状: {complete_tensor.indices().shape}")
+                    else:
+                        print(f"完整数据使用密集存储，数据类型: {complete_tensor.dtype}")
+                    
+            except Exception as e:
+                print(f"加载文件时出错 ({complete_path} 或 {incomplete_path}): {e}")
+                # 添加空占位符
+                shape = (112, 225, 1024)  # 默认形状
+                self.complete_data.append((torch.zeros(shape, dtype=torch.float16), False))
+                self.incomplete_data.append((torch.zeros(shape, dtype=torch.float16), False))
+        
+        # 显示内存节省统计
+        if self.sparse_count > 0:
+            avg_savings_percent = (1 - self.sparse_size / self.dense_size) * 100 if self.dense_size > 0 else 0
+            print(f"数据存储统计:")
+            print(f"  - 稀疏张量: {self.sparse_count}个，估计内存: {self.sparse_size/1024/1024:.2f} MB")
+            print(f"  - 密集张量: {self.dense_count}个，估计内存: {self.dense_size/1024/1024:.2f} MB")
+            print(f"  - 总内存节省: {avg_savings_percent:.2f}%")
+        
+        print(f"成功预加载 {len(self.complete_data)} 对数据到内存")
+    
+    def _convert_to_appropriate_format(self, numpy_array, sparsity):
+        """根据稀疏度选择合适的存储格式"""
+        # 如果数据足够稀疏，使用稀疏表示
+        if sparsity > self.sparsity_threshold:
+            # 获取非零元素的索引和值
+            indices = np.nonzero(numpy_array)
+            values = numpy_array[indices]
+            
+            # 创建稀疏张量
+            sparse_tensor = torch.sparse_coo_tensor(
+                torch.LongTensor(np.vstack(indices)), 
+                torch.tensor(values, dtype=torch.float16),
+                torch.Size(numpy_array.shape)
+            )
+            
+            # 估计内存占用
+            self.sparse_size += (len(values) * (2 + 2 * len(indices)))  # 值和索引的内存
+            self.sparse_count += 1
+            
+            return sparse_tensor, True
+        else:
+            # 使用半精度密集张量
+            dense_tensor = torch.tensor(numpy_array, dtype=torch.float16)
+            
+            # 估计内存占用
+            self.dense_size += numpy_array.size * 2  # float16占用2字节
+            self.dense_count += 1
+            
+            return dense_tensor, False
+    
+    def __len__(self):
+        return len(self.complete_data)
+    
+    def __getitem__(self, idx):
+        # 获取数据
+        complete_tensor, complete_is_sparse = self.complete_data[idx]
+        incomplete_tensor, incomplete_is_sparse = self.incomplete_data[idx]
+        
+        # 如果是稀疏张量，转换为密集张量以便处理
+        if complete_is_sparse:
+            complete_tensor = complete_tensor.to_dense()
+        if incomplete_is_sparse:
+            incomplete_tensor = incomplete_tensor.to_dense()
+        
+        # 应用变换（如果有）
+        if self.transform:
+            complete_tensor = self.transform(complete_tensor)
+            incomplete_tensor = self.transform(incomplete_tensor)
+        
+        return incomplete_tensor.float(), complete_tensor.float()
+
 
 # 混合精度训练函数
 def train_one_epoch(model, dataloader, criterion, optimizer, device, epoch, amp_enabled=True):
@@ -370,7 +521,7 @@ def main():
     
     # 创建数据集
     train_dataset = SinogramNpyDataset(args.data_dir, is_train=True)
-    # test_dataset = SinogramNpyDataset(args.data_dir, is_train=False)
+    test_dataset = SparseSinogramDataset(args.data_dir, is_train=False)
     
     # 从训练集中分离验证集
     val_size = int(len(train_dataset) * args.val_split)
@@ -382,7 +533,7 @@ def main():
     
     print(f"Training set size: {train_size}")
     print(f"Validation set size: {val_size}")
-    # print(f"Test set size: {len(test_dataset)}")
+    print(f"Test set size: {len(test_dataset)}")
     
     # 创建数据加载器
     train_loader = DataLoader(
@@ -401,13 +552,13 @@ def main():
         pin_memory=True
     )
     
-    # test_loader = DataLoader(
-    #     test_dataset,
-    #     batch_size=args.batch_size,
-    #     shuffle=False,
-    #     num_workers=4,
-    #     pin_memory=True
-    # )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
     
     # 初始化模型
     model = SinogramTransformer(
@@ -498,11 +649,11 @@ def main():
             }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
             
             # 保存样本预测
-            # save_prediction_sample(
-            #     model, test_dataset, device, 
-            #     os.path.join(sample_dir, f'epoch_{epoch+1}'),
-            #     epoch
-            # )
+            save_prediction_sample(
+                model, test_dataset, device, 
+                os.path.join(sample_dir, f'epoch_{epoch+1}'),
+                epoch
+            )
             
             # 绘制训练曲线
             plot_training_curves(
@@ -525,12 +676,12 @@ def main():
         'val_ssim': val_metrics[-1]['ssim']
     }, os.path.join(checkpoint_dir, 'final_model.pth'))
     
-    # # 在测试集上评估
-    # print("Evaluating on test set...")
-    # test_loss, test_psnr, test_ssim = validate(
-    #     model, test_loader, criterion, device
-    # )
-    # print(f"Test Loss: {test_loss:.4f}, PSNR: {test_psnr:.2f}, SSIM: {test_ssim:.4f}")
+    # 在测试集上评估
+    print("Evaluating on test set...")
+    test_loss, test_psnr, test_ssim = validate(
+        model, test_loader, criterion, device
+    )
+    print(f"Test Loss: {test_loss:.4f}, PSNR: {test_psnr:.2f}, SSIM: {test_ssim:.4f}")
     
     # 保存最终训练曲线
     plot_training_curves(
